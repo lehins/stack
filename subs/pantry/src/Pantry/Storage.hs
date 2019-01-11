@@ -11,6 +11,7 @@ module Pantry.Storage
   ( SqlBackend
   , initStorage
   , withStorage
+  , migrateAll
   , storeBlob
   , loadBlob
   , loadBlobById
@@ -29,6 +30,7 @@ module Pantry.Storage
   , storeTree
   , loadTree
   , loadPackageById
+  , getPackageNameById
   , getTreeForKey
   , storeHackageTree
   , loadHackageTree
@@ -41,10 +43,12 @@ module Pantry.Storage
   , loadPreferredVersion
   , sinkHackagePackageNames
   , countHackageCabals
-
+  , PackageNameId
+  , Unique(..)
     -- avoid warnings
   , BlobId
   , HackageCabalId
+  , HackageCabal(..)
   , HackageTarballId
   , CacheUpdateId
   , FilePathId
@@ -205,6 +209,14 @@ withStorage action = do
   P.Storage pool <- view $ P.pantryConfigL.to P.pcStorage
   runSqlPool action pool
 
+
+getPackageNameById
+  :: MonadIO m
+  => PackageNameId
+  -> ReaderT SqlBackend m (Maybe P.PackageName)
+getPackageNameById = fmap (unPackageNameP . packageNameName <$>) . get
+
+
 getPackageNameId
   :: (HasPantryConfig env, HasLogFunc env)
   => P.PackageName
@@ -263,10 +275,7 @@ loadBlobBySHA
   -> ReaderT SqlBackend (RIO env) (Maybe BlobId)
 loadBlobBySHA sha = listToMaybe <$> selectKeysList [BlobSha ==. sha] []
 
-loadBlobById
-  :: (HasPantryConfig env, HasLogFunc env)
-  => BlobId
-  -> ReaderT SqlBackend (RIO env) ByteString
+loadBlobById :: (MonadIO m) => BlobId -> ReaderT SqlBackend m ByteString
 loadBlobById bid = do
   mbt <- get bid
   case mbt of
@@ -292,6 +301,7 @@ getBlobId (P.BlobKey sha size) = do
   res <- rawSql "SELECT id FROM blob WHERE sha=? AND size=?"
            [toPersistValue sha, toPersistValue size]
   pure $ listToMaybe $ map unSingle res
+
 
 loadURLBlob
   :: (HasPantryConfig env, HasLogFunc env)

@@ -100,6 +100,10 @@ library:
   # For testing
   - Pantry.Internal
   - Pantry.Internal.StaticBytes
+  # For stackage-server
+  - Pantry.Storage
+  - Pantry.Types
+  - Pantry.Hackage
 
   # FIXME must be removed from pantry!
   - Data.Aeson.Extended

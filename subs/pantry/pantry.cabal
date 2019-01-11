@@ -1,10 +1,10 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.30.0.
+-- This file has been generated from package.yaml by hpack version 0.31.0.
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: bfc4bfcec8fa396290c6a92012ae46cae07ca2bd329e9ae0ca7aaec18202474f
+-- hash: d9fd41a02d6abd8bcf59ea072bec9be443ab4d4192f52548a37c56ee53b3c12a
 
 name:           pantry
 version:        0.1.0.0
@@ -33,18 +33,18 @@ library
       Pantry.SHA256
       Pantry.Internal
       Pantry.Internal.StaticBytes
+      Pantry.Storage
+      Pantry.Types
+      Pantry.Hackage
       Data.Aeson.Extended
       Data.Store
       Data.Store.Version
   other-modules:
       Hackage.Security.Client.Repository.HttpLib.HttpClient
       Pantry.Archive
-      Pantry.Hackage
       Pantry.HTTP
       Pantry.Repo
-      Pantry.Storage
       Pantry.Tree
-      Pantry.Types
       Paths_pantry
   hs-source-dirs:
       src/

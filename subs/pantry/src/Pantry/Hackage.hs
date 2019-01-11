@@ -4,6 +4,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 module Pantry.Hackage
   ( updateHackageIndex
+  , forceUpdateHackageIndex
   , DidUpdateOccur (..)
   , hackageIndexTarballL
   , getHackageTarball
@@ -77,7 +78,26 @@ updateHackageIndex
   :: (HasPantryConfig env, HasLogFunc env)
   => Maybe Utf8Builder -- ^ reason for updating, if any
   -> RIO env DidUpdateOccur
-updateHackageIndex mreason = gateUpdate $ do
+updateHackageIndex = updateHackageIndexInternal False
+
+-- | Same as `updateHackageIndex`, but force the database update even if hackage
+-- security tells that there is no change.  This can be useful in order to make
+-- sure the database is in sync with the locally downloaded tarball
+--
+-- @since 0.1.0.0
+forceUpdateHackageIndex
+  :: (HasPantryConfig env, HasLogFunc env)
+  => Maybe Utf8Builder
+  -> RIO env DidUpdateOccur
+forceUpdateHackageIndex = updateHackageIndexInternal True
+
+
+updateHackageIndexInternal
+  :: (HasPantryConfig env, HasLogFunc env)
+  => Bool -- ^ Force the database update.
+  -> Maybe Utf8Builder -- ^ reason for updating, if any
+  -> RIO env DidUpdateOccur
+updateHackageIndexInternal forceUpdate mreason = gateUpdate $ do
     for_ mreason logInfo
     pc <- view pantryConfigL
     let HackageSecurityConfig keyIds threshold url = pcHackageSecurity pc
@@ -111,8 +131,8 @@ updateHackageIndex mreason = gateUpdate $ do
         HS.checkForUpdates repo (Just now)
 
     case didUpdate of
-      HS.NoUpdates -> logInfo "No package index update available"
-      HS.HasUpdates -> do
+      HS.NoUpdates | not forceUpdate -> logInfo "No package index update available"
+      _ -> do
         logInfo "Updated package index downloaded"
         updateCache tarball
     logStickyDone "Package index cache populated"
@@ -166,11 +186,13 @@ updateHackageIndex mreason = gateUpdate $ do
               if oldHash == oldHashCheck
                 then oldSize <$ logInfo "Updating preexisting cache, should be quick"
                 else 0 <$ do
-                  logInfo "Package index change detected, that's pretty unusual"
-                  logInfo $ "Old size: " <> display oldSize
-                  logInfo $ "Old hash (orig) : " <> display oldHash
-                  logInfo $ "New hash (check): " <> display oldHashCheck
-                  logInfo "Forcing a recache"
+                  logWarn $ mconcat [
+                    "Package index change detected, that's pretty unusual: "
+                    , "\n    Old size: " <> display oldSize
+                    , "\n    Old hash (orig) : " <> display oldHash
+                    , "\n    New hash (check): " <> display oldHashCheck
+                    , "\n    Forcing a recache"
+                    ]
             pure (offset, newHash, newSize)
 
       lift $ logInfo $ "Populating cache from file size " <> display newSize <> ", hash " <> display newHash
