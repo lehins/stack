@@ -8,6 +8,7 @@ module Pantry.Hackage
   , DidUpdateOccur (..)
   , hackageIndexTarballL
   , getHackageTarball
+  , getHackageTarballOnGPD
   , getHackageTarballKey
   , getHackageCabalFile
   , getHackagePackageVersions
@@ -26,7 +27,7 @@ import qualified RIO.ByteString as B
 import qualified RIO.ByteString.Lazy as BL
 import Pantry.Archive
 import Pantry.Types hiding (FileType (..))
-import Pantry.Storage
+import Pantry.Storage hiding (TreeEntry)
 import Pantry.Tree
 import qualified Pantry.SHA256 as SHA256
 import Network.URI (parseURI)
@@ -37,6 +38,7 @@ import qualified Distribution.PackageDescription as Cabal
 import System.IO (SeekMode (..))
 import qualified Data.List.NonEmpty as NE
 import Data.Text.Metrics (damerauLevenshtein)
+import Distribution.PackageDescription (GenericPackageDescription)
 import Distribution.Types.Version (versionNumbers)
 import Distribution.Types.VersionRange (withinRange)
 
@@ -457,7 +459,18 @@ getHackageTarball
   => PackageIdentifierRevision
   -> Maybe TreeKey
   -> RIO env Package
-getHackageTarball pir@(PackageIdentifierRevision name ver _cfi) mtreeKey = do
+getHackageTarball = getHackageTarballOnGPD (\ _ _ -> pure ())
+
+-- | Same as `getHackageTarball`, but allows an extra action to be performed on the parsed
+-- `GenericPackageDescription` and newly created `TreeId`.
+getHackageTarballOnGPD
+  :: (HasPantryConfig env, HasLogFunc env)
+  => (TreeId -> GenericPackageDescription -> RIO env ())
+  -> PackageIdentifierRevision
+  -> Maybe TreeKey
+  -> RIO env Package
+getHackageTarballOnGPD onGPD pir mtreeKey = do
+  let PackageIdentifierRevision name ver _cfi = pir
   cabalFile <- resolveCabalFileInfo pir
   cabalFileKey <- withStorage $ getBlobKey cabalFile
   withCachedTree name ver cabalFile $ do
@@ -522,7 +535,8 @@ getHackageTarball pir@(PackageIdentifierRevision name ver _cfi) mtreeKey = do
             , mismatchActual = gpdIdent
             }
 
-        (_tid, treeKey') <- withStorage $ storeTree ident tree' cabalEntry
+        (tid, treeKey') <- storeTree ident tree' cabalEntry
+        onGPD tid gpd
         pure Package
           { packageTreeKey = treeKey'
           , packageTree = tree'

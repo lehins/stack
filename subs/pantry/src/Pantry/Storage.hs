@@ -7,12 +7,14 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE LambdaCase #-}
 module Pantry.Storage
   ( SqlBackend
   , initStorage
   , withStorage
   , migrateAll
   , storeBlob
+  , storeBlobSafe
   , loadBlob
   , loadBlobById
   , loadBlobBySHA
@@ -31,6 +33,8 @@ module Pantry.Storage
   , loadTree
   , loadPackageById
   , getPackageNameById
+  , getPackageNameId
+  , getVersionId
   , getTreeForKey
   , storeHackageTree
   , loadHackageTree
@@ -44,15 +48,20 @@ module Pantry.Storage
   , sinkHackagePackageNames
   , countHackageCabals
   , PackageNameId
+  , VersionId
   , Unique(..)
+  , EntityField(..)
     -- avoid warnings
   , BlobId
+  , unBlobKey
   , HackageCabalId
   , HackageCabal(..)
   , HackageTarballId
   , CacheUpdateId
   , FilePathId
+  , Tree(..)
   , TreeId
+  , TreeEntry(..)
   , TreeEntryId
   , ArchiveCacheId
   , RepoCacheId
@@ -70,6 +79,7 @@ import RIO.Orphans ()
 import qualified Pantry.SHA256 as SHA256
 import qualified RIO.Map as Map
 import RIO.Time (UTCTime, getCurrentTime)
+import qualified RIO.Text as T
 import Path (Path, Abs, File, toFilePath, parent)
 import Path.IO (ensureDir)
 import Data.Pool (destroyAllResources)
@@ -218,22 +228,16 @@ getPackageNameById = fmap (unPackageNameP . packageNameName <$>) . get
 
 
 getPackageNameId
-  :: (HasPantryConfig env, HasLogFunc env)
+  :: MonadIO m
   => P.PackageName
-  -> ReaderT SqlBackend (RIO env) PackageNameId
+  -> ReaderT SqlBackend m PackageNameId
 getPackageNameId = fmap (either entityKey id) . insertBy . PackageName . PackageNameP
 
 getVersionId
-  :: (HasPantryConfig env, HasLogFunc env)
+  :: MonadIO m
   => P.Version
-  -> ReaderT SqlBackend (RIO env) VersionId
+  -> ReaderT SqlBackend m VersionId
 getVersionId = fmap (either entityKey id) . insertBy . Version . VersionP
-
-getFilePathId
-  :: (HasPantryConfig env, HasLogFunc env)
-  => SafeFilePath
-  -> ReaderT SqlBackend (RIO env) FilePathId
-getFilePathId = fmap (either entityKey id) . insertBy . FilePath
 
 storeBlob
   :: (HasPantryConfig env, HasLogFunc env)
@@ -245,11 +249,36 @@ storeBlob bs = do
   keys <- selectKeysList [BlobSha ==. sha] []
   key <-
     case keys of
-      [] -> insert Blob
+      [] -> either entityKey id <$> insertBy Blob
               { blobSha = sha
               , blobSize = size
               , blobContents = bs
               }
+      key:rest -> assert (null rest) (pure key)
+  pure (key, P.BlobKey sha size)
+
+
+storeBlobSafe
+  :: (HasPantryConfig env, HasLogFunc env)
+  => ByteString
+  -> RIO env (BlobId, BlobKey)
+storeBlobSafe bs = do
+  let sha = SHA256.hashBytes bs
+      size = FileSize $ fromIntegral $ B.length bs
+  keys <- withStorage $ selectKeysList [BlobSha ==. sha] []
+  key <-
+    case keys of
+      [] -> do
+        eExc <- tryAny $ withStorage $ insert_ Blob
+              { blobSha = sha
+              , blobSize = size
+              , blobContents = bs
+              }
+        keys' <- withStorage $ selectKeysList [BlobSha ==. sha] []
+        case keys' of
+            [] | Right () <- eExc -> error "Blob should have beeen inserted by now"
+            [] | Left exc <- eExc -> throwM exc
+            key:rest -> assert (null rest) (pure key)
       key:rest -> assert (null rest) (pure key)
   pure (key, P.BlobKey sha size)
 
@@ -447,46 +476,66 @@ loadHackageTarballInfo name version = do
   where
     go (Entity _ ht) = (hackageTarballSha ht, hackageTarballSize ht)
 
+getFilePathId
+  :: (HasPantryConfig env, HasLogFunc env)
+  => SafeFilePath
+  -> ReaderT SqlBackend (RIO env) FilePathId
+getFilePathId sfp =
+  selectKeysList [FilePathPath ==. sfp] [] >>= \case
+    []     -> error $ "SafeFilePath '" ++ fp ++ "' was expected to be in the database already"
+    [fpId] -> pure fpId
+    _      -> error $ "FilePath unique constraint key is violated for: " ++ fp
+  where
+    fp = T.unpack (P.unSafeFilePath sfp)
+
+
+addTreePaths ::
+  (HasPantryConfig env, HasLogFunc env) => P.Tree -> RIO env ()
+addTreePaths (P.TreeMap m) = forM_ (Map.keys m) (tryAny . withStorage . insert_ . FilePath)
+
 storeTree
   :: (HasPantryConfig env, HasLogFunc env)
   => P.PackageIdentifier
   -> P.Tree
   -> P.TreeEntry
   -- ^ cabal file
-  -> ReaderT SqlBackend (RIO env) (TreeId, P.TreeKey)
+  -> RIO env (TreeId, P.TreeKey)
 storeTree (P.PackageIdentifier name version) tree@(P.TreeMap m) (P.TreeEntry (P.BlobKey cabal _) cabalType) = do
-  (bid, blobKey) <- storeBlob $ P.renderTree tree
-  mcabalid <- loadBlobBySHA cabal
-  cabalid <-
-    case mcabalid of
-      Just cabalid -> pure cabalid
-      Nothing -> error $ "storeTree: cabal BlobKey not found: " ++ show (tree, cabal)
-  nameid <- getPackageNameId name
-  versionid <- getVersionId version
-  etid <- insertBy Tree
-    { treeKey = bid
-    , treeCabal = cabalid
-    , treeCabalType = cabalType
-    , treeName = nameid
-    , treeVersion = versionid
-    }
-  case etid of
-    Left (Entity tid _) -> pure (tid, P.TreeKey blobKey) -- already in database, assume it matches
-    Right tid -> do
-      for_ (Map.toList m) $ \(sfp, P.TreeEntry blobKey' ft) -> do
-        sfpid <- getFilePathId sfp
-        mbid <- getBlobId blobKey'
-        bid' <-
-          case mbid of
-            Nothing -> error $ "Cannot store tree, contains unknown blob: " ++ show blobKey'
-            Just bid' -> pure bid'
-        insert_ TreeEntry
-          { treeEntryTree = tid
-          , treeEntryPath = sfpid
-          , treeEntryBlob = bid'
-          , treeEntryType = ft
-          }
-      pure (tid, P.TreeKey blobKey)
+  -- To avoid concurrency issues store all of the file paths in separate sql transactions
+  addTreePaths tree
+  withStorage $ do
+    (bid, blobKey) <- storeBlob $ P.renderTree tree
+    mcabalid <- loadBlobBySHA cabal
+    cabalid <-
+      case mcabalid of
+        Just cabalid -> pure cabalid
+        Nothing -> error $ "storeTree: cabal BlobKey not found: " ++ show (tree, cabal)
+    nameid <- getPackageNameId name
+    versionid <- getVersionId version
+    etid <- insertBy Tree
+      { treeKey = bid
+      , treeCabal = cabalid
+      , treeCabalType = cabalType
+      , treeName = nameid
+      , treeVersion = versionid
+      }
+    case etid of
+      Left (Entity tid _) -> pure (tid, P.TreeKey blobKey) -- already in database, assume it matches
+      Right tid -> do
+        for_ (Map.toList m) $ \(sfp, P.TreeEntry blobKey' ft) -> do
+          sfpid <- getFilePathId sfp
+          mbid <- getBlobId blobKey'
+          bid' <-
+            case mbid of
+              Nothing -> error $ "Cannot store tree, contains unknown blob: " ++ show blobKey'
+              Just bid' -> pure bid'
+          insert_ TreeEntry
+            { treeEntryTree = tid
+            , treeEntryPath = sfpid
+            , treeEntryBlob = bid'
+            , treeEntryType = ft
+            }
+        pure (tid, P.TreeKey blobKey)
 
 loadTree
   :: (HasPantryConfig env, HasLogFunc env)

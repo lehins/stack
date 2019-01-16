@@ -12,7 +12,7 @@ module Pantry.Archive
 
 import RIO
 import qualified Pantry.SHA256 as SHA256
-import Pantry.Storage
+import Pantry.Storage hiding (Tree, TreeEntry)
 import Pantry.Tree
 import Pantry.Types
 import Pantry.Internal (normalizeParents, makeTarRelative)
@@ -380,7 +380,7 @@ parseArchive pli archive fp = do
               if mePath me `Set.member` toSave
                 then do
                   bs <- mconcat <$> sinkList
-                  (_, blobKey) <- lift $ withStorage $ storeBlob bs
+                  (_, blobKey) <- lift $ storeBlobSafe bs
                   pure $ Map.insert (mePath me) blobKey m
                 else pure m
           tree <- fmap (TreeMap . Map.fromList) $ for safeFiles $ \(sfp, se) ->
@@ -401,7 +401,7 @@ parseArchive pli archive fp = do
             throwIO $ WrongCabalFileName pli cabalPath name
 
           -- It's good! Store the tree, let's bounce
-          (_tid, treeKey) <- withStorage $ storeTree ident tree cabalEntry
+          (_tid, treeKey) <- storeTree ident tree cabalEntry
           pure Package
             { packageTreeKey = treeKey
             , packageTree = tree
