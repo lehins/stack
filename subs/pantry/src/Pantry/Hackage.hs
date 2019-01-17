@@ -472,8 +472,8 @@ getHackageTarballOnGPD
 getHackageTarballOnGPD onGPD pir mtreeKey = do
   let PackageIdentifierRevision name ver _cfi = pir
   cabalFile <- resolveCabalFileInfo pir
-  cabalFileKey <- withStorage $ getBlobKey cabalFile
   withCachedTree name ver cabalFile $ do
+    cabalFileKey <- withStorage $ getBlobKey cabalFile
     mpair <- withStorage $ loadHackageTarballInfo name ver
     (sha, size) <-
       case mpair of
@@ -535,7 +535,7 @@ getHackageTarballOnGPD onGPD pir mtreeKey = do
             , mismatchActual = gpdIdent
             }
 
-        (tid, treeKey') <- storeTree ident tree' cabalEntry
+        (tid, treeKey') <- withStorage $ storeTree ident tree' cabalEntry
         onGPD tid gpd
         pure Package
           { packageTreeKey = treeKey'
