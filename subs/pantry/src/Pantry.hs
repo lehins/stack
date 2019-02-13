@@ -148,7 +148,7 @@ import qualified RIO.FilePath as FilePath
 import Pantry.Archive
 import Pantry.Repo
 import qualified Pantry.SHA256 as SHA256
-import Pantry.Storage hiding (TreeEntry)
+import Pantry.Storage hiding (TreeEntry, PackageName, Version)
 import Pantry.Tree
 import Pantry.Types
 import Pantry.Hackage

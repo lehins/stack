@@ -27,7 +27,7 @@ import qualified RIO.ByteString as B
 import qualified RIO.ByteString.Lazy as BL
 import Pantry.Archive
 import Pantry.Types hiding (FileType (..))
-import Pantry.Storage hiding (TreeEntry)
+import Pantry.Storage hiding (TreeEntry, PackageName, Version)
 import Pantry.Tree
 import qualified Pantry.SHA256 as SHA256
 import Network.URI (parseURI)

@@ -47,7 +47,9 @@ module Pantry.Storage
   , sinkHackagePackageNames
   , countHackageCabals
   , PackageNameId
+  , PackageName
   , VersionId
+  , Version
   , Unique(..)
   , EntityField(..)
     -- avoid warnings
@@ -250,24 +252,6 @@ getVersionId
   => P.Version
   -> ReaderT SqlBackend m VersionId
 getVersionId = fmap (either entityKey id) . insertBy . Version . VersionP
-
--- storeBlob
---   :: (HasPantryConfig env, HasLogFunc env)
---   => ByteString
---   -> ReaderT SqlBackend (RIO env) (BlobId, BlobKey)
--- storeBlob bs = do
---   let sha = SHA256.hashBytes bs
---       size = FileSize $ fromIntegral $ B.length bs
---   keys <- selectKeysList [BlobSha ==. sha] []
---   key <-
---     case keys of
---       [] -> either entityKey id <$> insertBy Blob
---               { blobSha = sha
---               , blobSize = size
---               , blobContents = bs
---               }
---       key:rest -> assert (null rest) (pure key)
---   pure (key, P.BlobKey sha size)
 
 storeBlob
   :: MonadIO m
