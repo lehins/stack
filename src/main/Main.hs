@@ -756,11 +756,12 @@ uploadCmd sdistOpts go = do
         unless (null dirs) $
             forM_ dirs $ \dir -> do
                 pkgDir <- resolveDir' dir
-                (tarName, tarBytes, mcabalRevision) <- getSDistTarball (sdoptsPvpBounds sdistOpts) pkgDir
-                checkSDistTarball' sdistOpts tarName tarBytes
+                (tarName, tarBytesStream, mcabalRevision) <-
+                  getSDistTarball (sdoptsPvpBounds sdistOpts) pkgDir
+                checkSDistTarballSource sdistOpts tarName tarBytesStream
                 liftIO $ do
                   creds <- runMemoized getCreds
-                  Upload.uploadBytes hackageUrl creds tarName tarBytes
+                  Upload.uploadBytes hackageUrl creds tarName tarBytesStream
                   forM_ mcabalRevision $ uncurry $ Upload.uploadRevision hackageUrl creds
                 tarPath <- parseRelFile tarName
                 when

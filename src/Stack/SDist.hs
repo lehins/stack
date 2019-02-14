@@ -1,29 +1,35 @@
-{-# LANGUAGE NoImplicitPrelude #-}
-{-# LANGUAGE ConstraintKinds       #-}
-{-# LANGUAGE FlexibleContexts      #-}
-{-# LANGUAGE OverloadedStrings     #-}
-{-# LANGUAGE RankNTypes            #-}
-{-# LANGUAGE DeriveDataTypeable    #-}
-{-# LANGUAGE TypeFamilies          #-}
+{-# LANGUAGE ConstraintKinds    #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleContexts   #-}
+{-# LANGUAGE LambdaCase         #-}
+{-# LANGUAGE NoImplicitPrelude  #-}
+{-# LANGUAGE OverloadedStrings  #-}
+{-# LANGUAGE RankNTypes         #-}
+{-# LANGUAGE TypeFamilies       #-}
 -- Create a source distribution tarball
 module Stack.SDist
     ( getSDistTarball
     , checkSDistTarball
-    , checkSDistTarball'
+    , checkSDistTarballSource
     , SDistOpts (..)
     ) where
 
+import qualified Data.Conduit.Tar as CTar
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as Tar
 import qualified Codec.Compression.GZip as GZip
+import qualified Conduit as C
 import           Control.Applicative
 import           Control.Concurrent.Execute (ActionContext(..), Concurrency(..))
-import           Stack.Prelude hiding (Display (..))
+import           Stack.Prelude -- hiding (Display (..))
 import           Control.Monad.Reader.Class (local)
+import           Control.Monad.Trans.Resource (ResourceT)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as L
 import           Data.Char (toLower)
+import           Data.Conduit (runConduitRes)
+import           Data.Conduit.Zlib (gzip, ungzip)
 import           Data.Data (cast)
 import           Data.List
 import           Data.List.NonEmpty (NonEmpty)
@@ -99,65 +105,77 @@ instance Show CheckException where
 -- While this yields a 'FilePath', the name of the tarball, this
 -- tarball is not written to the disk and instead yielded as a lazy
 -- bytestring.
-getSDistTarball
-  :: HasEnvConfig env
-  => Maybe PvpBounds            -- ^ Override Config value
-  -> Path Abs Dir               -- ^ Path to local package
-  -> RIO env (FilePath, L.ByteString, Maybe (PackageIdentifier, L.ByteString))
+getSDistTarball ::
+       HasEnvConfig env
+    => Maybe PvpBounds -- ^ Override Config value
+    -> Path Abs Dir -- ^ Path to local package
+    -> RIO env ( FilePath
+               , ConduitM () ByteString (ResourceT (RIO env)) ()
+               , Maybe (PackageIdentifier, L.ByteString))
   -- ^ Filename, tarball contents, and option cabal file revision to upload
 getSDistTarball mpvpBounds pkgDir = do
     config <- view configL
-    let PvpBounds pvpBounds asRevision = fromMaybe (configPvpBounds config) mpvpBounds
+    let PvpBounds pvpBounds asRevision =
+            fromMaybe (configPvpBounds config) mpvpBounds
         tweakCabal = pvpBounds /= PvpBoundsNone
         pkgFp = toFilePath pkgDir
     lp <- readLocalPackage pkgDir
-    sourceMap <- view $ envConfigL.to envConfigSourceMap
+    sourceMap <- view $ envConfigL . to envConfigSourceMap
     logInfo $ "Getting file list for " <> fromString pkgFp
-    (fileList, cabalfp) <- getSDistFileList lp
+    -- Use cabal to get the list of fiels to be included into the sdist tarball
+    (files, cabalfp) <- getSDistFileList lp
     logInfo $ "Building sdist tarball for " <> fromString pkgFp
-    files <- normalizeTarballPaths (map (T.unpack . stripCR . T.pack) (lines fileList))
-
     -- We're going to loop below and eventually find the cabal
     -- file. When we do, we'll upload this reference, if the
     -- mpvpBounds value indicates that we should be uploading a cabal
     -- file revision.
     cabalFileRevisionRef <- liftIO (newIORef Nothing)
-
-    -- NOTE: Could make this use lazy I/O to only read files as needed
-    -- for upload (both GZip.compress and Tar.write are lazy).
-    -- However, it seems less error prone and more predictable to read
-    -- everything in at once, so that's what we're doing for now:
-    let tarPath isDir fp = either throwString return
-            (Tar.toTarPath isDir (forceUtf8Enc (pkgId FP.</> fp)))
-        -- convert a String of proper characters to a String of bytes
-        -- in UTF8 encoding masquerading as characters. This is
-        -- necessary for tricking the tar package into proper
-        -- character encoding.
-        forceUtf8Enc = S8.unpack . T.encodeUtf8 . T.pack
-        packWith f isDir fp = liftIO $ f (pkgFp FP.</> fp) =<< tarPath isDir fp
-        packDir = packWith Tar.packDirectoryEntry True
-        packFile fp
+    let getFileContent fp
             -- This is a cabal file, we're going to tweak it, but only
             -- tweak it as a revision.
             | tweakCabal && isCabalFp fp && asRevision = do
                 lbsIdent <- getCabalLbs pvpBounds (Just 1) cabalfp sourceMap
                 liftIO (writeIORef cabalFileRevisionRef (Just lbsIdent))
-                packWith packFileEntry False fp
+                content <- liftIO $ S.readFile fp
+                return (Nothing, content)
             -- Same, except we'll include the cabal file in the
             -- original tarball upload.
             | tweakCabal && isCabalFp fp = do
                 (_ident, lbs) <- getCabalLbs pvpBounds Nothing cabalfp sourceMap
-                currTime <- liftIO getPOSIXTime -- Seconds from UNIX epoch
-                tp <- liftIO $ tarPath False fp
-                return $ (Tar.fileEntry tp lbs) { Tar.entryTime = floor currTime }
-            | otherwise = packWith packFileEntry False fp
+                curTime <- curModTime
+                return (Just curTime, L.toStrict lbs)
+            | otherwise = do
+                content <- liftIO $ S.readFile fp
+                return (Nothing, content)
         isCabalFp fp = toFilePath pkgDir FP.</> fp == toFilePath cabalfp
         tarName = pkgId FP.<.> "tar.gz"
         pkgId = packageIdentifierString (packageIdentifier (lpPackage lp))
-    dirEntries <- mapM packDir (dirsFromFiles files)
-    fileEntries <- mapM packFile files
+        packFileConduit dirsSet =
+            C.await >>= \case
+                Just fp -> do
+                    (mtime, content) <- lift $ lift $ getFileContent fp
+                    fi <- getFileInfo pkgFp fp (fromIntegral (S.length content))
+                    let curDirsSet = dirsFromFileName dirsSet fp
+                        dirs = Set.toAscList curDirsSet
+                    (mapM (dirFileInfo pkgFp) dirs >>= C.yieldMany) .|
+                        C.mapC Left
+                    C.yield $
+                        Left $
+                        maybe fi (\time -> fi {CTar.fileModTime = time}) mtime
+                    C.yield $ Right content
+                    packFileConduit (Set.union dirsSet curDirsSet)
+                Nothing -> pure ()
+        -- We ought to create a directory entry for the root folder, eg. foo-1.2.3/
+        yieldPkgRoot = do
+          curTime <- curModTime
+          C.yield $ Left $ baseFileInfo curTime CTar.FTDirectory (CTar.encodeFilePath pkgFp)
+        tarByteStream =
+            C.yieldMany files .|
+            (yieldPkgRoot >> packFileConduit (Set.singleton ".")) .|
+            void CTar.tar .|
+            gzip
     mcabalFileRevision <- liftIO (readIORef cabalFileRevisionRef)
-    return (tarName, GZip.compress (Tar.write (dirEntries ++ fileEntries)), mcabalFileRevision)
+    return (tarName, tarByteStream, mcabalFileRevision)
 
 -- | Get the PVP bounds-enabled version of the given cabal file
 getCabalLbs :: HasEnvConfig env
@@ -317,8 +335,8 @@ readLocalPackage pkgDir = do
         , lpUnbuildable = Set.empty
         }
 
--- | Returns a newline-separate list of paths, and the absolute path to the .cabal file.
-getSDistFileList :: HasEnvConfig env => LocalPackage -> RIO env (String, Path Abs File)
+-- | Returns a list of normalized paths, and the absolute path to the .cabal file.
+getSDistFileList :: HasEnvConfig env => LocalPackage -> RIO env ([FilePath], Path Abs File)
 getSDistFileList lp =
     withSystemTempDir (stackProgName <> "-sdist") $ \tmpdir -> do
         let bopts = defaultBuildOpts
@@ -332,7 +350,9 @@ getSDistFileList lp =
                 let outFile = toFilePath tmpdir FP.</> "source-files-list"
                 cabal KeepTHLoading ["sdist", "--list-sources", outFile]
                 contents <- liftIO (S.readFile outFile)
-                return (T.unpack $ T.decodeUtf8With T.lenientDecode contents, cabalfp)
+                let fileList = T.lines $ T.decodeUtf8With T.lenientDecode contents
+                files <- normalizeTarballPaths (map (T.unpack . stripCR) fileList)
+                return (files, cabalfp)
   where
     package = lpPackage lp
     ac = ActionContext Set.empty [] ConcurrencyAllowed
@@ -372,12 +392,11 @@ normalizePath = fmap FP.joinPath . go . FP.splitDirectories . FP.normalise
     go (_:"..":xs) = go xs
     go (x:xs) = (x :) <$> go xs
 
-dirsFromFiles :: [FilePath] -> [FilePath]
-dirsFromFiles dirs = Set.toAscList (Set.delete "." results)
+dirsFromFileName :: Set FilePath -> FilePath -> Set FilePath
+dirsFromFileName dirsSet fp = go Set.empty $ FP.takeDirectory fp
   where
-    results = foldl' (\s -> go s . FP.takeDirectory) Set.empty dirs
     go s x
-      | Set.member x s = s
+      | Set.member x dirsSet = s
       | otherwise = go (Set.insert x s) (FP.takeDirectory x)
 
 -- | Check package in given tarball. This will log all warnings
@@ -393,6 +412,16 @@ checkSDistTarball opts tarball = withTempTarGzContents tarball $ \pkgDir' -> do
     pkgDir  <- (pkgDir' </>) `liftM`
         (parseRelDir . FP.takeBaseName . FP.takeBaseName . toFilePath $ tarball)
     --               ^ drop ".tar"     ^ drop ".gz"
+    checkSDistExtractedTarball opts pkgDir
+
+-- | Check package in supplied folder, which should contain the extracted sdist tarball. This will
+-- log all warnings and will throw an exception in case of critical errors.
+checkSDistExtractedTarball
+  :: HasEnvConfig env
+  => SDistOpts -- ^ The configuration of what to check
+  -> Path Abs Dir -- ^ Absolute path to tarball
+  -> RIO env ()
+checkSDistExtractedTarball opts pkgDir = do
     when (sdoptsBuildTarball opts) (buildExtractedTarball ResolvedPath
                                       { resolvedRelative = RelFilePath "this-is-not-used" -- ugly hack
                                       , resolvedAbsolute = pkgDir
@@ -465,51 +494,92 @@ buildExtractedTarball pkgDir = do
         sm {smProject = Map.insert (cpName $ ppCommon pp) pp pathsToKeep}
   local adjustEnvForBuild $ build Nothing Nothing
 
--- | Version of 'checkSDistTarball' that first saves lazy bytestring to
--- temporary directory and then calls 'checkSDistTarball' on it.
-checkSDistTarball'
+-- | Version of 'checkSDistTarball' that validates the tarball, which is available as a stream of
+-- bytes, rather than as a file on the file system. Contents will be extracted to a temporary
+-- directory for analysis.
+checkSDistTarballSource
   :: HasEnvConfig env
   => SDistOpts
-  -> String       -- ^ Tarball name
-  -> L.ByteString -- ^ Tarball contents as a byte string
+  -> ConduitM () ByteString (ResourceT (RIO env)) () -- ^ GZipped tarball contents as a stream of bytes
   -> RIO env ()
-checkSDistTarball' opts name bytes = withSystemTempDir "stack" $ \tpath -> do
-    npath   <- (tpath </>) `liftM` parseRelFile name
-    liftIO $ L.writeFile (toFilePath npath) bytes
-    checkSDistTarball opts npath
+checkSDistTarballSource opts bytesStream = withSystemTempDir "stack" $ \tpath -> do
+    extractTarGz bytesStream tpath
+    checkSDistExtractedTarball opts tpath
 
-withTempTarGzContents
-  :: Path Abs File                     -- ^ Location of tarball
-  -> (Path Abs Dir -> RIO env a) -- ^ Perform actions given dir with tarball contents
-  -> RIO env a
-withTempTarGzContents apath f = withSystemTempDir "stack" $ \tpath -> do
-    archive <- liftIO $ L.readFile (toFilePath apath)
-    liftIO . Tar.unpack (toFilePath tpath) . Tar.read . GZip.decompress $ archive
-    f tpath
+withTempTarGzContents ::
+       HasLogFunc env
+    => Path Abs File -- ^ Location of tarball
+    -> (Path Abs Dir -> RIO env a) -- ^ Perform actions given dir with tarball contents
+    -> RIO env a
+withTempTarGzContents apath f = withSystemTempDir "stack" $ \tpath ->
+    extractTarGz (C.sourceFileBS (toFilePath apath)) tpath >> f tpath
 
+extractTarGz ::
+       HasLogFunc env
+    => ConduitM () ByteString (ResourceT (RIO env)) () -- ^ GZipped tarball source
+    -> Path Abs Dir -- ^ Folder where tarball should be extract to. This path must already exist.
+    -> RIO env ()
+extractTarGz tarSource cd = do
+    fiExcs <- runConduitRes $
+        tarSource .| ungzip .|
+        CTar.untarWithExceptions (CTar.restoreFileIntoLenient (toFilePath cd))
+    mapM_ reportTarFileError fiExcs
+  where
+    reportTarFileError (fi, excs) =
+        forM_ (mapMaybe fromException excs) $ \case
+            CTar.UnsupportedType ty ->
+                logWarn $
+                "Unsupported file type: " <> displayShow ty <> " with name: " <>
+                displayBytesUtf8 (CTar.filePath fi)
+            _ -> pure ()
 --------------------------------------------------------------------------------
 
--- Copy+modified from the tar package to avoid issues with lazy IO ( see
--- https://github.com/commercialhaskell/stack/issues/1344 )
+getFileInfo ::
+       MonadIO m => FilePath -> FilePath -> CTar.FileOffset -> m CTar.FileInfo
+getFileInfo baseDir filepath size = do
+    perms <- liftIO $ getPermissions filepath
+    fi <- modFileInfo CTar.FTNormal baseDir filepath
+    let fi' =
+            if executable perms
+                then fi
+                else fi {CTar.fileMode = 0o644}
+    pure $ fi' {CTar.fileSize = size}
 
-packFileEntry :: FilePath -- ^ Full path to find the file on the local disk
-              -> Tar.TarPath  -- ^ Path to use for the tar Entry in the archive
-              -> IO Tar.Entry
-packFileEntry filepath tarpath = do
-  mtime   <- getModTime filepath
-  perms   <- getPermissions filepath
-  content <- S.readFile filepath
-  let size = fromIntegral (S.length content)
-  return (Tar.simpleEntry tarpath (Tar.NormalFile (L.fromStrict content) size)) {
-    Tar.entryPermissions = if executable perms then Tar.executableFilePermissions
-                                               else Tar.ordinaryFilePermissions,
-    Tar.entryTime = mtime
-  }
+dirFileInfo :: MonadIO m => FilePath -> FilePath -> m CTar.FileInfo
+dirFileInfo baseDir = modFileInfo CTar.FTDirectory baseDir
 
-getModTime :: FilePath -> IO Tar.EpochTime
-getModTime path = do
-    t <- getModificationTime path
-    return . floor . utcTimeToPOSIXSeconds $ t
+modFileInfo ::
+       MonadIO m => CTar.FileType -> FilePath -> FilePath -> m CTar.FileInfo
+modFileInfo fileType baseDir filepath = do
+    mtime <- getModTime filepath
+    pure $ baseFileInfo mtime fileType (CTar.encodeFilePath (baseDir FP.</> filepath))
+
+curModTime :: MonadIO m => m CTar.EpochTime
+curModTime = do
+    currTime <- floor <$> liftIO getPOSIXTime -- Seconds from UNIX epoch
+    return $ fromIntegral (currTime :: Int64)
+
+baseFileInfo :: CTar.EpochTime -> CTar.FileType -> ByteString -> CTar.FileInfo
+baseFileInfo modTime fileType filePath =
+    CTar.FileInfo
+        { CTar.filePath = filePath
+        , CTar.fileUserId = 0
+        , CTar.fileUserName = ""
+        , CTar.fileGroupId = 0
+        , CTar.fileGroupName = ""
+        , CTar.fileMode = 0o755
+        , CTar.fileSize = 0
+        , CTar.fileModTime = modTime
+        , CTar.fileType = fileType
+        }
+
+getModTime :: MonadIO m => FilePath -> m CTar.EpochTime
+getModTime path =
+    toEpoch . floor . utcTimeToPOSIXSeconds <$>
+    liftIO (getModificationTime path)
+  where
+    toEpoch i = fromIntegral (i :: Int64)
+
 
 getDefaultPackageConfig :: (MonadIO m, MonadReader env m, HasEnvConfig env)
   => m PackageConfig
