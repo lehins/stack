@@ -8,16 +8,13 @@
 {-# LANGUAGE TypeFamilies       #-}
 -- Create a source distribution tarball
 module Stack.SDist
-    ( getSDistTarball
+    ( makeSDistTarball
     , checkSDistTarball
-    , checkSDistTarballSource
+    , checkSDistTarballSink
     , SDistOpts (..)
     ) where
 
 import qualified Data.Conduit.Tar as CTar
-import qualified Codec.Archive.Tar as Tar
-import qualified Codec.Archive.Tar.Entry as Tar
-import qualified Codec.Compression.GZip as GZip
 import qualified Conduit as C
 import           Control.Applicative
 import           Control.Concurrent.Execute (ActionContext(..), Concurrency(..))
@@ -25,10 +22,8 @@ import           Stack.Prelude -- hiding (Display (..))
 import           Control.Monad.Reader.Class (local)
 import           Control.Monad.Trans.Resource (ResourceT)
 import qualified Data.ByteString as S
-import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as L
 import           Data.Char (toLower)
-import           Data.Conduit (runConduitRes)
 import           Data.Conduit.Zlib (gzip, ungzip)
 import           Data.Data (cast)
 import           Data.List
@@ -99,21 +94,18 @@ instance Show CheckException where
     "Package check reported the following errors:\n" ++
     (intercalate "\n" . fmap show . NE.toList $ xs)
 
--- | Given the path to a local package, creates its source
--- distribution tarball.
+-- | Given the path to a local package, creates its source distribution tarball.
 --
 -- While this yields a 'FilePath', the name of the tarball, this
--- tarball is not written to the disk and instead yielded as a lazy
--- bytestring.
-getSDistTarball ::
+-- tarball is handled according to the supplied sink.
+makeSDistTarball ::
        HasEnvConfig env
     => Maybe PvpBounds -- ^ Override Config value
     -> Path Abs Dir -- ^ Path to local package
-    -> RIO env ( FilePath
-               , ConduitM () ByteString (ResourceT (RIO env)) ()
-               , Maybe (PackageIdentifier, L.ByteString))
+    -> (Path Rel File -> ConduitM ByteString Void (ResourceT (RIO env)) a)
+    -> RIO env (a, Path Rel File, Maybe (PackageIdentifier, L.ByteString))
   -- ^ Filename, tarball contents, and option cabal file revision to upload
-getSDistTarball mpvpBounds pkgDir = do
+makeSDistTarball mpvpBounds pkgDir sinkSDist = do
     config <- view configL
     let PvpBounds pvpBounds asRevision =
             fromMaybe (configPvpBounds config) mpvpBounds
@@ -148,7 +140,6 @@ getSDistTarball mpvpBounds pkgDir = do
                 content <- liftIO $ S.readFile fp
                 return (Nothing, content)
         isCabalFp fp = toFilePath pkgDir FP.</> fp == toFilePath cabalfp
-        tarName = pkgId FP.<.> "tar.gz"
         pkgId = packageIdentifierString (packageIdentifier (lpPackage lp))
         packFileConduit dirsSet =
             C.await >>= \case
@@ -174,8 +165,10 @@ getSDistTarball mpvpBounds pkgDir = do
             (yieldPkgRoot >> packFileConduit (Set.singleton ".")) .|
             void CTar.tar .|
             gzip
+    tarName <- parseRelFile (pkgId FP.<.> "tar.gz")
+    res <- C.runConduitRes $ tarByteStream .| sinkSDist tarName
     mcabalFileRevision <- liftIO (readIORef cabalFileRevisionRef)
-    return (tarName, tarByteStream, mcabalFileRevision)
+    return (res, tarName, mcabalFileRevision)
 
 -- | Get the PVP bounds-enabled version of the given cabal file
 getCabalLbs :: HasEnvConfig env
@@ -496,33 +489,36 @@ buildExtractedTarball pkgDir = do
 
 -- | Version of 'checkSDistTarball' that validates the tarball, which is available as a stream of
 -- bytes, rather than as a file on the file system. Contents will be extracted to a temporary
--- directory for analysis.
-checkSDistTarballSource
+-- directory for analysis, which must be supplied as an argument. Consumes GZipped tarball contents
+-- as a stream of bytes and collects it all into memory as lazy ByteString
+checkSDistTarballSink
   :: HasEnvConfig env
   => SDistOpts
-  -> ConduitM () ByteString (ResourceT (RIO env)) () -- ^ GZipped tarball contents as a stream of bytes
-  -> RIO env ()
-checkSDistTarballSource opts bytesStream = withSystemTempDir "stack" $ \tpath -> do
-    extractTarGz bytesStream tpath
-    checkSDistExtractedTarball opts tpath
+  -> Path Abs Dir -- ^ Temporary path where tarball should be extracted to.
+  -> ConduitM ByteString Void (ResourceT (RIO env)) L.ByteString
+checkSDistTarballSink opts tpath = do
+    lbs <- C.getZipSink (C.ZipSink (extractTarGz tpath) *> C.ZipSink C.sinkLazy)
+    lift $ lift $ checkSDistExtractedTarball opts tpath
+    pure lbs
 
 withTempTarGzContents ::
        HasLogFunc env
     => Path Abs File -- ^ Location of tarball
     -> (Path Abs Dir -> RIO env a) -- ^ Perform actions given dir with tarball contents
     -> RIO env a
-withTempTarGzContents apath f = withSystemTempDir "stack" $ \tpath ->
-    extractTarGz (C.sourceFileBS (toFilePath apath)) tpath >> f tpath
+withTempTarGzContents tarballPath f = withSystemTempDir "stack" $ \tmpDir ->
+    C.withSourceFile (toFilePath tarballPath) $ \ sourceTarball -> do
+        C.runConduitRes $ sourceTarball .| extractTarGz tmpDir
+        f tmpDir
 
 extractTarGz ::
-       HasLogFunc env
-    => ConduitM () ByteString (ResourceT (RIO env)) () -- ^ GZipped tarball source
-    -> Path Abs Dir -- ^ Folder where tarball should be extract to. This path must already exist.
-    -> RIO env ()
-extractTarGz tarSource cd = do
-    fiExcs <- runConduitRes $
-        tarSource .| ungzip .|
-        CTar.untarWithExceptions (CTar.restoreFileIntoLenient (toFilePath cd))
+       (MonadReader env m, HasLogFunc env, C.MonadResource m, MonadThrow m, PrimMonad m)
+    => Path Abs Dir -- ^ Folder where tarball should be extract to. This path must already exist.
+    -> ConduitM ByteString a m ()
+extractTarGz extractIntoDir = do
+    fiExcs <-
+        ungzip .|
+        CTar.untarWithExceptions (CTar.restoreFileIntoLenient (toFilePath extractIntoDir))
     mapM_ reportTarFileError fiExcs
   where
     reportTarFileError (fi, excs) =

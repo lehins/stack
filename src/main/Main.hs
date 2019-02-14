@@ -18,7 +18,8 @@ module Main (main) where
 #ifndef HIDE_DEP_VERSIONS
 import qualified Build_stack
 #endif
-import           Stack.Prelude hiding (Display (..))
+import           Stack.Prelude hiding (Display (..), withSystemTempDir)
+import qualified Conduit as C
 import           Control.Monad.Reader (local)
 import           Control.Monad.Trans.Except (ExceptT)
 import           Control.Monad.Writer.Lazy (Writer)
@@ -91,7 +92,7 @@ import           Stack.Options.Utils
 import qualified Stack.Path
 import           Stack.Runners
 import           Stack.Script
-import           Stack.SDist (getSDistTarball, checkSDistTarball, checkSDistTarball', SDistOpts(..))
+import           Stack.SDist (makeSDistTarball, checkSDistTarball, checkSDistTarballSink, SDistOpts(..))
 import           Stack.Setup (withNewLocalBuildTargets)
 import           Stack.SetupCmd
 import qualified Stack.Sig as Sig
@@ -756,21 +757,21 @@ uploadCmd sdistOpts go = do
         unless (null dirs) $
             forM_ dirs $ \dir -> do
                 pkgDir <- resolveDir' dir
-                (tarName, tarBytesStream, mcabalRevision) <-
-                  getSDistTarball (sdoptsPvpBounds sdistOpts) pkgDir
-                checkSDistTarballSource sdistOpts tarName tarBytesStream
-                liftIO $ do
-                  creds <- runMemoized getCreds
-                  Upload.uploadBytes hackageUrl creds tarName tarBytesStream
-                  forM_ mcabalRevision $ uncurry $ Upload.uploadRevision hackageUrl creds
-                tarPath <- parseRelFile tarName
-                when
-                    (sdoptsSign sdistOpts)
-                    (void $
-                     Sig.signTarBytes
-                         (sdoptsSignServerUrl sdistOpts)
-                         tarPath
-                         tarBytes)
+                withSystemTempDir "stack" $ \ tmpDir -> do
+                    (tarBytes, tarName, mcabalRevision) <-
+                        makeSDistTarball (sdoptsPvpBounds sdistOpts) pkgDir $ \_tarName ->
+                            checkSDistTarballSink sdistOpts tmpDir
+                    liftIO $ do
+                      creds <- runMemoized getCreds
+                      Upload.uploadBytes hackageUrl creds (toFilePath tarName) tarBytes
+                      forM_ mcabalRevision $ uncurry $ Upload.uploadRevision hackageUrl creds
+                    when
+                        (sdoptsSign sdistOpts)
+                        (void $
+                         Sig.signTarBytes
+                             (sdoptsSignServerUrl sdistOpts)
+                             tarName
+                             tarBytes)
 
 sdistCmd :: SDistOpts -> GlobalOpts -> IO ()
 sdistCmd sdistOpts go =
@@ -792,20 +793,23 @@ sdistCmd sdistOpts go =
                 return dirs
             else mapM resolveDir' (sdoptsDirsToWorkWith sdistOpts)
         forM_ dirs' $ \dir -> do
-            (tarName, tarBytes, _mcabalRevision) <- getSDistTarball (sdoptsPvpBounds sdistOpts) dir
-            distDir <- distDirFromDir dir
-            tarPath <- (distDir </>) <$> parseRelFile tarName
-            ensureDir (parent tarPath)
-            liftIO $ L.writeFile (toFilePath tarPath) tarBytes
+            (tarPath, tarName, _mcabalRevision) <-
+                makeSDistTarball (sdoptsPvpBounds sdistOpts) dir $ \ tarName -> do
+                    distDir <- distDirFromDir dir
+                    let tarPath = distDir </> tarName
+                    ensureDir (parent tarPath)
+                    C.sinkFileCautious (toFilePath tarPath)
+                    pure tarPath
             prettyInfoL [flow "Wrote sdist tarball to", pretty tarPath]
             checkSDistTarball sdistOpts tarPath
-            forM_ (sdoptsTarPath sdistOpts) $ copyTarToTarPath tarPath tarName
+            forM_ (sdoptsTarPath sdistOpts) $
+              copyTarToTarPath (toFilePath tarPath) (toFilePath tarName)
             when (sdoptsSign sdistOpts) (void $ Sig.sign (sdoptsSignServerUrl sdistOpts) tarPath)
         where
           copyTarToTarPath tarPath tarName targetDir = liftIO $ do
             let targetTarPath = targetDir FP.</> tarName
             D.createDirectoryIfMissing True $ FP.takeDirectory targetTarPath
-            D.copyFile (toFilePath tarPath) targetTarPath
+            D.copyFile tarPath targetTarPath
 
 -- | Execute a command.
 execCmd :: ExecOpts -> GlobalOpts -> IO ()
