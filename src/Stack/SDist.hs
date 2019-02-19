@@ -24,7 +24,7 @@ import           Control.Monad.Trans.Resource (ResourceT)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy as L
 import           Data.Char (toLower)
-import           Data.Conduit.Zlib (gzip, ungzip)
+import           Data.Conduit.Zlib (WindowBits(..), compress, ungzip)
 import           Data.Data (cast)
 import           Data.List
 import           Data.List.NonEmpty (NonEmpty)
@@ -145,26 +145,25 @@ makeSDistTarball mpvpBounds pkgDir sinkSDist = do
             C.await >>= \case
                 Just fp -> do
                     (mtime, content) <- lift $ lift $ getFileContent fp
-                    fi <- getFileInfo pkgFp fp (fromIntegral (S.length content))
+                    fi <- getFileInfo pkgId fp (fromIntegral (S.length content))
                     let curDirsSet = dirsFromFileName dirsSet fp
                         dirs = Set.toAscList curDirsSet
-                    (mapM (dirFileInfo pkgFp) dirs >>= C.yieldMany) .|
-                        C.mapC Left
+                    (mapM (dirFileInfo pkgId) dirs >>= C.yieldMany) .| C.mapC Left
                     C.yield $
                         Left $
                         maybe fi (\time -> fi {CTar.fileModTime = time}) mtime
                     C.yield $ Right content
                     packFileConduit (Set.union dirsSet curDirsSet)
                 Nothing -> pure ()
-        -- We ought to create a directory entry for the root folder, eg. foo-1.2.3/
         yieldPkgRoot = do
           curTime <- curModTime
-          C.yield $ Left $ baseFileInfo curTime CTar.FTDirectory (CTar.encodeFilePath pkgFp)
+          -- We ought to create a directory entry for the root folder, eg. foo-1.2.3/
+          C.yield $ Left $ baseFileInfo curTime CTar.FTDirectory (CTar.encodeFilePath pkgId)
         tarByteStream =
             C.yieldMany files .|
             (yieldPkgRoot >> packFileConduit (Set.singleton ".")) .|
             void CTar.tar .|
-            gzip
+            compress (-1) (WindowBits 31) -- switch to zlib's default compression.
     tarName <- parseRelFile (pkgId FP.<.> "tar.gz")
     res <- C.runConduitRes $ tarByteStream .| sinkSDist tarName
     mcabalFileRevision <- liftIO (readIORef cabalFileRevisionRef)

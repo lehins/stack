@@ -15,11 +15,12 @@ Portability : POSIX
 
 module Stack.Sig.Sign (sign, signPackage, signTarBytes) where
 
-import qualified Codec.Archive.Tar as Tar
-import qualified Codec.Compression.GZip as GZip
 import           Stack.Prelude
+import qualified Conduit as C
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy as L
+import qualified Data.Conduit.Tar as CTar
+import           Data.Conduit.Zlib (ungzip)
 import qualified Distribution.PackageDescription as D
 import qualified Distribution.PackageDescription.Parsec as D
 import qualified Distribution.Verbosity as D
@@ -39,34 +40,27 @@ sign url filePath =
     withSystemTempDir
         "stack"
         (\tempDir ->
-              do bytes <-
-                     liftIO
-                         (fmap
-                              GZip.decompress
-                              (BS.readFile (toFilePath filePath)))
-                 maybePath <- extractCabalFile tempDir (Tar.read bytes)
+              do maybePath <- C.runConduitRes $ C.sourceFile (toFilePath filePath) .|
+                     ungzip .| CTar.untar (extractCabalFile tempDir) .| C.asumC
                  case maybePath of
                      Nothing -> throwM SigInvalidSDistTarBall
-                     Just cabalPath -> do
-                         pkg <- cabalFilePackageId (tempDir </> cabalPath)
+                     Just cabalFullPath -> do
+                         pkg <- cabalFilePackageId cabalFullPath
                          run (signPackage url pkg filePath))
   where
-    extractCabalFile tempDir (Tar.Next entry entries) =
-        case Tar.entryContent entry of
-            (Tar.NormalFile lbs _) ->
-                case FP.splitFileName (Tar.entryPath entry) of
+    extractCabalFile tempDir fi =
+        case CTar.fileType fi of
+            CTar.FTNormal ->
+                case FP.splitFileName (CTar.getFileInfoPath fi) of
                     (folder,file)
                       | length (FP.splitDirectories folder) == 1 &&
                             FP.takeExtension file == ".cabal" -> do
                           cabalFile <- parseRelFile file
-                          liftIO
-                              (BS.writeFile
-                                   (toFilePath (tempDir </> cabalFile))
-                                   lbs)
-                          return (Just cabalFile)
-                    (_,_) -> extractCabalFile tempDir entries
-            _ -> extractCabalFile tempDir entries
-    extractCabalFile _ _ = return Nothing
+                          let restorePath = tempDir </> cabalFile
+                          C.sinkFile (toFilePath restorePath)
+                          C.yield (Just restorePath)
+                    (_,_) -> C.yield Nothing
+            _ -> C.yield Nothing
 
 -- | Sign a haskell package with the given url to the signature
 -- service, a package tarball path (package tarball name) and a lazy
