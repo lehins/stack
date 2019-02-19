@@ -18,7 +18,7 @@ import qualified Data.Conduit.Tar as CTar
 import qualified Conduit as C
 import           Control.Applicative
 import           Control.Concurrent.Execute (ActionContext(..), Concurrency(..))
-import           Stack.Prelude -- hiding (Display (..))
+import           Stack.Prelude
 import           Control.Monad.Reader.Class (local)
 import           Control.Monad.Trans.Resource (ResourceT)
 import           Data.Bits ((.&.))

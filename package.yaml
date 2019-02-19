@@ -105,7 +105,6 @@ dependencies:
 - stm
 - store-core # FIXME remove
 - streaming-commons
-- tar
 - tar-conduit
 - template-haskell
 - temporary
