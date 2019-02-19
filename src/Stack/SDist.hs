@@ -21,6 +21,7 @@ import           Control.Concurrent.Execute (ActionContext(..), Concurrency(..))
 import           Stack.Prelude -- hiding (Display (..))
 import           Control.Monad.Reader.Class (local)
 import           Control.Monad.Trans.Resource (ResourceT)
+import           Data.Bits ((.&.))
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy as L
 import           Data.Char (toLower)
@@ -122,47 +123,49 @@ makeSDistTarball mpvpBounds pkgDir sinkSDist = do
     -- mpvpBounds value indicates that we should be uploading a cabal
     -- file revision.
     cabalFileRevisionRef <- liftIO (newIORef Nothing)
-    let getFileContent fp
+    let getCabalFile fp
             -- This is a cabal file, we're going to tweak it, but only
             -- tweak it as a revision.
-            | tweakCabal && isCabalFp fp && asRevision = do
+            | tweakCabal && asRevision = do
                 lbsIdent <- getCabalLbs pvpBounds (Just 1) cabalfp sourceMap
                 liftIO (writeIORef cabalFileRevisionRef (Just lbsIdent))
-                content <- liftIO $ S.readFile fp
+                content <- liftIO $ L.readFile fp
                 return (Nothing, content)
             -- Same, except we'll include the cabal file in the
             -- original tarball upload.
-            | tweakCabal && isCabalFp fp = do
+            | tweakCabal = do
                 (_ident, lbs) <- getCabalLbs pvpBounds Nothing cabalfp sourceMap
                 curTime <- curModTime
-                return (Just curTime, L.toStrict lbs)
+                return (Just curTime, lbs)
             | otherwise = do
-                content <- liftIO $ S.readFile fp
+                content <- liftIO $ L.readFile fp
                 return (Nothing, content)
         isCabalFp fp = toFilePath pkgDir FP.</> fp == toFilePath cabalfp
         pkgId = packageIdentifierString (packageIdentifier (lpPackage lp))
-        packFileConduit dirsSet =
-            C.await >>= \case
-                Just fp -> do
-                    (mtime, content) <- lift $ lift $ getFileContent fp
-                    fi <- getFileInfo pkgId fp (fromIntegral (S.length content))
-                    let curDirsSet = dirsFromFileName dirsSet fp
-                        dirs = Set.toAscList curDirsSet
-                    (mapM (dirFileInfo pkgId) dirs >>= C.yieldMany) .| C.mapC Left
-                    C.yield $
-                        Left $
-                        maybe fi (\time -> fi {CTar.fileModTime = time}) mtime
-                    C.yield $ Right content
-                    packFileConduit (Set.union dirsSet curDirsSet)
-                Nothing -> pure ()
-        yieldPkgRoot = do
-          curTime <- curModTime
-          -- We ought to create a directory entry for the root folder, eg. foo-1.2.3/
-          C.yield $ Left $ baseFileInfo curTime CTar.FTDirectory (CTar.encodeFilePath pkgId)
+        yieldPackageFiles pkgDir fs =
+            C.yieldMany fs .| CTar.tarFiles (Just pkgDir) (Just 1) Nothing .|
+            C.mapC (mapLeft resetFileInfo)
+        yieldCabalFile pkgDir fp = do
+            (mmodTime, cabalFileContent) <- lift $ lift $ getCabalFile fp
+            fi <- resetFileInfo <$> CTar.getFileInfo fp
+            C.yield $
+                Left $
+                fi
+                    { CTar.filePath = CTar.encodeFilePath (pkgId <> "/" <> FP.normalise fp)
+                    , CTar.fileSize = fromIntegral (L.length cabalFileContent)
+                    , CTar.fileModTime =
+                          fromMaybe (CTar.fileModTime fi) mmodTime
+                    }
+            C.sourceLazy cabalFileContent .| C.mapC Right
+        sourcePackage =
+            case break isCabalFp files of
+                (_, []) -> lift $ lift $ logError "Could not find a .cabal file"
+                (filesBeforeCabal, cabalFile:filesAfterCabal) -> do
+                    pkgDir <- CTar.makeDirectory pkgId
+                    yieldPackageFiles pkgDir (filesBeforeCabal ++ filesAfterCabal)
+                    yieldCabalFile pkgDir cabalFile
         tarByteStream =
-            C.yieldMany files .|
-            (yieldPkgRoot >> packFileConduit (Set.singleton ".")) .|
-            void CTar.tar .|
+            sourcePackage .| void CTar.tar .|
             compress (-1) (WindowBits 31) -- switch to zlib's default compression.
     tarName <- parseRelFile (pkgId FP.<.> "tar.gz")
     res <- C.runConduitRes $ tarByteStream .| sinkSDist tarName
@@ -529,51 +532,25 @@ extractTarGz extractIntoDir = do
             _ -> pure ()
 --------------------------------------------------------------------------------
 
-getFileInfo ::
-       MonadIO m => FilePath -> FilePath -> CTar.FileOffset -> m CTar.FileInfo
-getFileInfo baseDir filepath size = do
-    perms <- liftIO $ getPermissions filepath
-    fi <- modFileInfo CTar.FTNormal baseDir filepath
-    let fi' =
-            if executable perms
-                then fi
-                else fi {CTar.fileMode = 0o644}
-    pure $ fi' {CTar.fileSize = size}
+-- | Reset ownership to root and allow only 0o755 or 0o644 permissions.
+resetFileInfo :: CTar.FileInfo -> CTar.FileInfo
+resetFileInfo fi =
+    fi
+        { CTar.fileUserId = 0
+        , CTar.fileUserName = ""
+        , CTar.fileGroupId = 0
+        , CTar.fileGroupName = ""
+        , CTar.fileMode =
+              if CTar.fileMode fi .&. 0o700 == 0
+                  then 0o644
+                  else 0o755
+        }
 
-dirFileInfo :: MonadIO m => FilePath -> FilePath -> m CTar.FileInfo
-dirFileInfo baseDir = modFileInfo CTar.FTDirectory baseDir
-
-modFileInfo ::
-       MonadIO m => CTar.FileType -> FilePath -> FilePath -> m CTar.FileInfo
-modFileInfo fileType baseDir filepath = do
-    mtime <- getModTime filepath
-    pure $ baseFileInfo mtime fileType (CTar.encodeFilePath (baseDir FP.</> filepath))
 
 curModTime :: MonadIO m => m CTar.EpochTime
 curModTime = do
     currTime <- floor <$> liftIO getPOSIXTime -- Seconds from UNIX epoch
     return $ fromIntegral (currTime :: Int64)
-
-baseFileInfo :: CTar.EpochTime -> CTar.FileType -> ByteString -> CTar.FileInfo
-baseFileInfo modTime fileType filePath =
-    CTar.FileInfo
-        { CTar.filePath = filePath
-        , CTar.fileUserId = 0
-        , CTar.fileUserName = ""
-        , CTar.fileGroupId = 0
-        , CTar.fileGroupName = ""
-        , CTar.fileMode = 0o755
-        , CTar.fileSize = 0
-        , CTar.fileModTime = modTime
-        , CTar.fileType = fileType
-        }
-
-getModTime :: MonadIO m => FilePath -> m CTar.EpochTime
-getModTime path =
-    toEpoch . floor . utcTimeToPOSIXSeconds <$>
-    liftIO (getModificationTime path)
-  where
-    toEpoch i = fromIntegral (i :: Int64)
 
 
 getDefaultPackageConfig :: (MonadIO m, MonadReader env m, HasEnvConfig env)
