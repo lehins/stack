@@ -34,7 +34,7 @@ module Stack.Setup
   , downloadStackExe
   ) where
 
-import qualified    Codec.Archive.Tar as Tar
+import qualified    Data.Conduit.Tar as CTar
 import              Control.Applicative (empty)
 import              Control.Monad.State (get, put, modify)
 import "cryptonite" Crypto.Hash (SHA1(..), SHA256(..))
@@ -43,9 +43,8 @@ import qualified    Data.ByteString as S
 import qualified    Data.ByteString.Lazy as LBS
 import qualified    Data.ByteString.Lazy.Char8 as BL8
 import              Data.Char (isSpace)
-import              Data.Conduit (await, yield, awaitForever)
+import              Data.Conduit (await, yield, awaitForever, runConduitRes)
 import qualified    Data.Conduit.Binary as CB
-import              Data.Conduit.Lazy (lazyConsume)
 import              Data.Conduit.Lift (evalStateC)
 import qualified    Data.Conduit.List as CL
 import              Data.Conduit.Process.Typed (eceStderr)
@@ -2047,32 +2046,23 @@ downloadStackExe platforms0 archiveInfo destDir checkPath testExe = do
     handleTarball :: Path Abs File -> Bool -> T.Text -> IO ()
     handleTarball tmpFile isWindows url = do
         req <- fmap setGithubHeaders $ parseUrlThrow $ T.unpack url
-        withResponse req $ \res -> do
-            entries <- fmap (Tar.read . LBS.fromChunks)
-                     $ lazyConsume
-                     $ getResponseBody res .| ungzip
-            let loop Tar.Done = error $ concat
-                    [ "Stack executable "
-                    , show exeName
-                    , " not found in archive from "
-                    , T.unpack url
-                    ]
-                loop (Tar.Fail e) = throwM e
-                loop (Tar.Next e es)
-                    | Tar.entryPath e == exeName =
-                        case Tar.entryContent e of
-                            Tar.NormalFile lbs _ -> do
-                              ensureDir destDir
-                              LBS.writeFile (toFilePath tmpFile) lbs
-                            _ -> error $ concat
-                                [ "Invalid file type for tar entry named "
-                                , exeName
-                                , " downloaded from "
-                                , T.unpack url
-                                ]
-                    | otherwise = loop es
-            loop entries
+        result <- withResponse req $ \res ->
+            runConduitRes $ getResponseBody res
+                         .| ungzip
+                         .| CTar.untar extractExe
+                         .| CL.foldMap Any
+        unless (getAny result) $ error $ concat [ "Stack executable "
+                                                , show exeName
+                                                , " not found in archive from "
+                                                , T.unpack url
+                                                ]
       where
+        extractExe fi
+          | CTar.fileType fi == CTar.FTNormal && CTar.getFileInfoPath fi == exeName = do
+              ensureDir destDir
+              CB.sinkFile (toFilePath tmpFile)
+              yield True
+          | otherwise = yield False
         -- The takeBaseName drops the .gz, dropExtension drops the .tar
         exeName =
             let base = FP.dropExtension (FP.takeBaseName (T.unpack url)) FP.</> "stack"

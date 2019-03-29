@@ -123,47 +123,63 @@ makeSDistTarball mpvpBounds pkgDir sinkSDist = do
     -- mpvpBounds value indicates that we should be uploading a cabal
     -- file revision.
     cabalFileRevisionRef <- liftIO (newIORef Nothing)
-    let getCabalFile fp
+    let getCabalFile fp fi
             -- This is a cabal file, we're going to tweak it, but only
             -- tweak it as a revision.
             | tweakCabal && asRevision = do
                 lbsIdent <- getCabalLbs pvpBounds (Just 1) cabalfp sourceMap
                 liftIO (writeIORef cabalFileRevisionRef (Just lbsIdent))
-                content <- liftIO $ L.readFile fp
-                return (Nothing, content)
+                return (fi, C.sourceFile fp)
             -- Same, except we'll include the cabal file in the
             -- original tarball upload.
             | tweakCabal = do
                 (_ident, lbs) <- getCabalLbs pvpBounds Nothing cabalfp sourceMap
                 curTime <- curModTime
-                return (Just curTime, lbs)
-            | otherwise = do
-                content <- liftIO $ L.readFile fp
-                return (Nothing, content)
+                let fi' =
+                        fi
+                            { CTar.fileModTime = curTime
+                            , CTar.fileSize = fromIntegral (L.length lbs)
+                            }
+                pure (fi', C.sourceLazy lbs)
+            | otherwise = pure (fi, C.sourceFile fp)
         isCabalFp fp = toFilePath pkgDir FP.</> fp == toFilePath cabalfp
         pkgId = packageIdentifierString (packageIdentifier (lpPackage lp))
-        yieldPackageFiles pkgDir fs =
-            C.yieldMany fs .| CTar.tarFiles (Just pkgDir) (Just 1) Nothing .|
-            C.mapC (mapLeft resetFileInfo)
-        yieldCabalFile pkgDir fp = do
-            (mmodTime, cabalFileContent) <- lift $ lift $ getCabalFile fp
+        yieldPackageFiles fs conf =
+            C.fuseUpstream
+                (C.yieldMany fs .| CTar.tarFiles conf)
+                (C.mapC (mapLeft resetFileInfo))
+        yieldCabalFile fp = do
             fi <- resetFileInfo <$> CTar.getFileInfo fp
+            (fiAdjusted, cabalFileSource) <- lift $ lift $ getCabalFile fp fi
             C.yield $
                 Left $
-                fi
-                    { CTar.filePath = CTar.encodeFilePath (pkgId <> "/" <> FP.normalise fp)
-                    , CTar.fileSize = fromIntegral (L.length cabalFileContent)
-                    , CTar.fileModTime =
-                          fromMaybe (CTar.fileModTime fi) mmodTime
+                fiAdjusted
+                    { CTar.filePath =
+                          CTar.encodeFilePath (pkgId <> "/" <> FP.normalise fp)
                     }
-            C.sourceLazy cabalFileContent .| C.mapC Right
+            cabalFileSource .| C.mapC Right
         sourcePackage =
             case break isCabalFp files of
                 (_, []) -> lift $ lift $ logError "Could not find a .cabal file"
                 (filesBeforeCabal, cabalFile:filesAfterCabal) -> do
-                    pkgDir <- CTar.makeDirectory pkgId
-                    yieldPackageFiles pkgDir (filesBeforeCabal ++ filesAfterCabal)
-                    yieldCabalFile pkgDir cabalFile
+                    pkgBaseDir <- CTar.createFTDirectory pkgId
+                    C.yield $ Left pkgBaseDir
+                    let tarFilesConfig =
+                            CTar.defaultTarFilesConfig
+                                { CTar.tarFilesBaseDirectory = Just pkgBaseDir
+                                , CTar.tarFilesDepth = Just 1
+                                , CTar.tarFilesDirectories =
+                                      Set.singleton
+                                          (CTar.getFileInfoPath pkgBaseDir)
+                                }
+                    createdDirs <-
+                        yieldPackageFiles filesBeforeCabal tarFilesConfig
+                    yieldCabalFile cabalFile
+                    void $
+                        yieldPackageFiles
+                            filesAfterCabal
+                            tarFilesConfig
+                                {CTar.tarFilesDirectories = createdDirs}
         tarByteStream =
             sourcePackage .| void CTar.tar .|
             compress (-1) (WindowBits 31) -- switch to zlib's default compression.

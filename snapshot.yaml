@@ -13,7 +13,7 @@ packages:
 - yaml-0.10.4.0@rev:0 #for hpack-0.31
 #- tar-conduit-0.3.0@sha256:c220b7a74b986445d08706aed77f17f82807d0133a5f3a760f53d587d20865b2,2928
 - git: https://github.com/snoyberg/tar-conduit.git
-  commit: e4177aad8400f9af52f9dadfa256fa1e805b3c92
+  commit: 1b34b0224039f802f82337b1757e0973226b3a49
 - hackage-security-0.5.3.0@rev:2
 - http-api-data-0.3.8.1@rev:1
 - cabal-doctest-1.0.6@rev:2
