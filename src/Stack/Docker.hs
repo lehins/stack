@@ -409,7 +409,8 @@ checkDockerVersion docker =
                throwIO (BadDockerVersionException (dockerRequireDockerVersion docker) v')
              | otherwise ->
                return ()
-           _ -> throwIO InvalidVersionOutputException
+           _ -> logWarn $ "Can't parse docker version: " <> fromString v
+           --throwIO InvalidVersionOutputException
        _ -> throwIO InvalidVersionOutputException
   where minimumDockerVersion = mkVersion [1, 6, 0]
         prohibitedDockerVersions = []
